@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import re
 
 # -----------------------------
 # Synthetic patient generator
@@ -45,6 +46,104 @@ def generate_synthetic_patients(n=300, seed=42):
 
 
 # -----------------------------
+# NLP-lite: protocol parsing
+# -----------------------------
+
+# Age patterns: "Age between 40 and 70", "Age 40-70"
+AGE_RANGE_RE = re.compile(
+    r"age\s*(?:between|from)?\s*(\d{1,3})\s*(?:-|to|and)\s*(\d{1,3})",
+    re.IGNORECASE,
+)
+
+# "Age >= 40", "Age at least 40"
+AGE_MIN_RE = re.compile(
+    r"age\s*(?:>=|≥|at least|minimum|min)\s*(\d{1,3})",
+    re.IGNORECASE,
+)
+
+# "Age <= 70", "Age at most 70"
+AGE_MAX_RE = re.compile(
+    r"age\s*(?:<=|≤|at most|maximum|max)\s*(\d{1,3})",
+    re.IGNORECASE,
+)
+
+# Diagnosis / condition line: "Diagnosis: Type 2 Diabetes"
+DIAG_RE = re.compile(
+    r"(diagnosis|condition)\s*:\s*([a-z0-9 \-\&\/]+)",
+    re.IGNORECASE,
+)
+
+# Biomarker lines: "Biomarker A >= 1.8", "Biomarker B <= 60"
+BIOMARKER_RE = re.compile(
+    r"biomarker\s*(A|B)\s*(>=|≤|<=|≥|>|<|=)\s*([0-9]+(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
+
+# "Exclude smokers" or "No smokers"
+EXCLUDE_SMOKER_RE = re.compile(
+    r"(exclude|no)\s*smokers",
+    re.IGNORECASE,
+)
+
+
+def parse_protocol_text(txt: str):
+    """
+    Very simple, rule-based parser that extracts structured criteria
+    from free-text protocol descriptions.
+    """
+    txt = (txt or "").strip()
+
+    criteria = {
+        "age_min": None,
+        "age_max": None,
+        "diagnosis_required": None,
+        "biomarkers": [],  # list of {"name": "A"/"B", "op": ">=", "value": float}
+        "exclude_smokers": False,
+    }
+
+    # Age range
+    m_range = AGE_RANGE_RE.search(txt)
+    if m_range:
+        criteria["age_min"] = int(m_range.group(1))
+        criteria["age_max"] = int(m_range.group(2))
+    else:
+        # Age min only
+        mmin = AGE_MIN_RE.search(txt)
+        if mmin:
+            criteria["age_min"] = int(mmin.group(1))
+
+        # Age max only
+        mmax = AGE_MAX_RE.search(txt)
+        if mmax:
+            criteria["age_max"] = int(mmax.group(1))
+
+    # Diagnosis / condition
+    m_diag = DIAG_RE.search(txt)
+    if m_diag:
+        criteria["diagnosis_required"] = m_diag.group(2).strip()
+
+    # Biomarkers
+    for bm in BIOMARKER_RE.finditer(txt):
+        name, op, val = bm.group(1).upper(), bm.group(2), float(bm.group(3))
+        # Normalize ops like ≥, ≤ to >=, <=
+        norm_map = {"≥": ">=", "<=": "<=", "≤": "<=", ">=": ">=", ">": ">", "<": "<", "=": "="}
+        op = norm_map.get(op, op)
+        criteria["biomarkers"].append(
+            {
+                "name": name,  # "A" or "B"
+                "op": op,      # ">=", "<=", etc.
+                "value": val,
+            }
+        )
+
+    # Exclude smokers
+    if EXCLUDE_SMOKER_RE.search(txt):
+        criteria["exclude_smokers"] = True
+
+    return criteria
+
+
+# -----------------------------
 # Streamlit app
 # -----------------------------
 st.set_page_config(
@@ -65,10 +164,10 @@ We are building it step-by-step.
 **Current focus**
 1. Generate a synthetic patient dataset
 2. Accept mock protocol criteria as text (or uploaded .txt file)
+3. Parse the protocol text into structured criteria (NLP-lite)
 
-Later steps:
-- Parse the protocol criteria (NLP-lite)
-- Score and rank patients by how well they match
+Next steps:
+- Use the parsed criteria to score and rank patients by match
 """
 )
 
@@ -142,12 +241,25 @@ protocol_text = st.text_area(
     height=180,
     help=(
         "This represents the free-text eligibility description from a clinical trial protocol.\n"
-        "In the next step, we'll parse this into structured criteria for matching."
+        "The app will parse this into structured criteria below."
     ),
 )
 
 st.markdown("**Current protocol text:**")
 st.code(protocol_text, language="text")
+
+# -----------------------------
+# Parse protocol text into structured criteria
+# -----------------------------
+criteria = parse_protocol_text(protocol_text)
+
+st.markdown("**Parsed structured criteria (NLP-lite):**")
+st.json(criteria)
+
+st.info(
+    "✅ The protocol text is now being parsed into a structured representation.\n\n"
+    "Next step will be to use these criteria to score and rank each patient based on how well they match."
+)
 
 st.info(
     "✅ You can now define trial eligibility as free text.\n\n"
