@@ -184,8 +184,8 @@ def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
     scores = []
     explanations = []
 
-    n_bio = max(1, len(criteria.get("biomarkers", [])))
-    bio_each = weight_cfg["biomarkers_total"] / n_bio
+    n_bio = max(1, len(criteria.get("biomarkers", []))) if criteria.get("biomarkers") else 0
+    bio_each = weight_cfg["biomarkers_total"] / n_bio if n_bio > 0 else 0
 
     for _, row in df.iterrows():
         s = 0.0
@@ -244,9 +244,6 @@ def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
         scores.append(s)
         explanations.append(reasons)
 
-        # You could treat very low scores as effectively "not eligible",
-        # but for PoC we'll just show the full range 0–100.
-
     out = df.copy()
     out["MatchScore"] = np.round(scores, 1)
     out["Explanation"] = [json.dumps(r, ensure_ascii=False) for r in explanations]
@@ -271,11 +268,12 @@ st.markdown(
 This app demonstrates a **simple AI-assisted clinical trial patient matching PoC**
 using synthetic EHR-style data.
 
-**What it does now**
+**Current capabilities**
 1. Generates a synthetic patient dataset
 2. Accepts mock protocol criteria as free text (or uploaded .txt file)
 3. Parses the protocol into structured criteria (NLP-lite)
 4. Applies a transparent, rule-based scoring system to rank patients by match
+5. Provides a simple chatbot-style interface to query trial criteria
 """
 )
 
@@ -303,7 +301,7 @@ st.sidebar.header("📄 Protocol Upload (optional)")
 uploaded_protocol = st.sidebar.file_uploader(
     "Upload protocol text file (.txt)",
     type=["txt"],
-    help="If provided, this will override the default protocol text."
+    help="If provided, this will override the default protocol text in the main panel."
 )
 
 # -----------------------------
@@ -362,12 +360,11 @@ st.markdown("**Parsed structured criteria (NLP-lite):**")
 st.json(criteria)
 
 # -----------------------------
-# Score and rank patients
+# Score and rank patients (main view)
 # -----------------------------
 st.markdown("---")
 st.subheader("🧮 Ranked Patient Matches")
 
-# Let user choose minimum score threshold
 min_score = st.slider(
     "Minimum MatchScore to display",
     min_value=0,
@@ -423,8 +420,70 @@ st.download_button(
     mime="text/csv",
 )
 
+# -----------------------------
+# Chatbot-style interface
+# -----------------------------
+st.markdown("---")
+st.subheader("💬 Chatbot-style Trial Criteria Interface")
+
+st.markdown(
+    """
+Type a natural-language description of trial criteria below.
+The assistant will:
+
+1. Parse your message into structured criteria (using the same NLP-lite logic)
+2. Score all synthetic patients
+3. Reply with parsed criteria and the top 5 matching patients
+"""
+)
+
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []
+
+chat_input = st.text_input(
+    "Describe the trial criteria (e.g., 'Age 45-70 with Type 2 Diabetes, Biomarker A >= 2, exclude smokers')",
+    key="chat_input",
+)
+
+if st.button("Send", type="primary"):
+    user_text = chat_input.strip()
+    if user_text:
+        # Add user message to history
+        st.session_state["chat_history"].append(
+            {"role": "user", "text": user_text}
+        )
+
+        # Parse & score
+        chat_criteria = parse_protocol_text(user_text)
+        chat_scored = score_patients(patients_df, chat_criteria)
+        top5 = chat_scored.head(5)[["PatientID", "MatchScore", "Age", "Gender", "Diagnosis"]]
+
+        # Build assistant reply text
+        reply_lines = []
+        reply_lines.append("Parsed criteria:")
+        reply_lines.append(json.dumps(chat_criteria, indent=2))
+        reply_lines.append("")
+        reply_lines.append("Top 5 matching patients (PatientID, MatchScore, Age, Gender, Diagnosis):")
+        reply_lines.append(top5.to_string(index=False))
+
+        reply_text = "\n".join(reply_lines)
+
+        st.session_state["chat_history"].append(
+            {"role": "assistant", "text": reply_text}
+        )
+
+        # Clear input
+        st.session_state["chat_input"] = ""
+
+# Display chat history
+for msg in st.session_state["chat_history"]:
+    if msg["role"] == "user":
+        st.markdown(f"**You:** {msg['text']}")
+    else:
+        st.markdown("**Assistant:**")
+        st.code(msg["text"], language="text")
+
 st.info(
-    "✅ You now have an end-to-end PoC: synthetic patients → protocol text → parsed criteria → "
-    "rule-based AI scoring → ranked patient list.\n\n"
-    "You can adjust the protocol text and immediately see how eligibility and scores change."
+    "This chatbot-style interface reuses the same parsing and scoring engine as the main view, "
+    "but wraps it in a conversational experience."
 )
