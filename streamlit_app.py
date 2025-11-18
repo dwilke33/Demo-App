@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+import json
 
 # -----------------------------
 # Synthetic patient generator
@@ -126,7 +127,7 @@ def parse_protocol_text(txt: str):
     for bm in BIOMARKER_RE.finditer(txt):
         name, op, val = bm.group(1).upper(), bm.group(2), float(bm.group(3))
         # Normalize ops like ≥, ≤ to >=, <=
-        norm_map = {"≥": ">=", "<=": "<=", "≤": "<=", ">=": ">=", ">": ">", "<": "<", "=": "="}
+        norm_map = {"≥": ">=", "≤": "<=", "<=": "<=", ">=": ">=", ">": ">", "<": "<", "=": "="}
         op = norm_map.get(op, op)
         criteria["biomarkers"].append(
             {
@@ -144,6 +145,117 @@ def parse_protocol_text(txt: str):
 
 
 # -----------------------------
+# Simple rule-based scoring
+# -----------------------------
+
+def compare(value, op, threshold):
+    """Compare a numeric value to a threshold using a simple operator."""
+    if pd.isna(value):
+        return None  # treat missing as unknown
+    if op == ">=":
+        return value >= threshold
+    if op == "<=":
+        return value <= threshold
+    if op == ">":
+        return value > threshold
+    if op == "<":
+        return value < threshold
+    if op == "=":
+        return abs(value - threshold) < 1e-6
+    return None
+
+
+def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
+    """
+    Simple, transparent scoring:
+    - Age match: up to 20 points
+    - Diagnosis match: 25 points
+    - Biomarkers: up to 35 points (shared)
+    - Non-smoker when smokers are excluded: 20 points
+    """
+    if weight_cfg is None:
+        weight_cfg = {
+            "age": 20,
+            "diagnosis": 25,
+            "biomarkers_total": 35,   # split equally across listed biomarkers
+            "exclude_smokers": 20,
+        }
+
+    scores = []
+    explanations = []
+
+    n_bio = max(1, len(criteria.get("biomarkers", [])))
+    bio_each = weight_cfg["biomarkers_total"] / n_bio
+
+    for _, row in df.iterrows():
+        s = 0.0
+        reasons = []
+
+        # ---- Age ----
+        age_ok = True
+        if criteria.get("age_min") is not None:
+            if row["Age"] >= criteria["age_min"]:
+                reasons.append(f"+ age >= {criteria['age_min']}")
+            else:
+                reasons.append(f"- age < {criteria['age_min']}")
+                age_ok = False
+        if criteria.get("age_max") is not None:
+            if row["Age"] <= criteria["age_max"]:
+                reasons.append(f"+ age <= {criteria['age_max']}")
+            else:
+                reasons.append(f"- age > {criteria['age_max']}")
+                age_ok = False
+        if (criteria.get("age_min") is not None) or (criteria.get("age_max") is not None):
+            if age_ok:
+                s += weight_cfg["age"]
+
+        # ---- Diagnosis ----
+        diag_req = criteria.get("diagnosis_required")
+        if diag_req:
+            if diag_req.lower() in str(row["Diagnosis"]).lower():
+                s += weight_cfg["diagnosis"]
+                reasons.append(f"+ diagnosis matches ({diag_req})")
+            else:
+                reasons.append(f"- diagnosis mismatch (needs {diag_req})")
+
+        # ---- Biomarkers ----
+        for bio in criteria.get("biomarkers", []):
+            col = f"Biomarker_{bio['name']}"
+            val = row.get(col, np.nan)
+            comp = compare(val, bio["op"], bio["value"])
+            if comp is None:
+                reasons.append(f"~ {col} missing")
+            elif comp:
+                s += bio_each
+                reasons.append(f"+ {col} {bio['op']} {bio['value']}")
+            else:
+                reasons.append(f"- {col} not {bio['op']} {bio['value']} (val={val})")
+
+        # ---- Exclude smokers ----
+        if criteria.get("exclude_smokers", False):
+            if row["Smoker"] == 0:
+                s += weight_cfg["exclude_smokers"]
+                reasons.append("+ non-smoker")
+            else:
+                reasons.append("- smoker (excluded)")
+
+        # Clamp to [0, 100]
+        s = float(np.clip(s, 0, 100))
+        scores.append(s)
+        explanations.append(reasons)
+
+        # You could treat very low scores as effectively "not eligible",
+        # but for PoC we'll just show the full range 0–100.
+
+    out = df.copy()
+    out["MatchScore"] = np.round(scores, 1)
+    out["Explanation"] = [json.dumps(r, ensure_ascii=False) for r in explanations]
+    out.sort_values("MatchScore", ascending=False, inplace=True)
+    out.reset_index(drop=True, inplace=True)
+    return out
+
+
+# -----------------------------
 # Streamlit app
 # -----------------------------
 st.set_page_config(
@@ -156,18 +268,14 @@ st.title("🧪 Clinical Trial Patient Matching – PoC")
 
 st.markdown(
     """
-This app will eventually demonstrate **AI-assisted clinical trial patient matching**
+This app demonstrates a **simple AI-assisted clinical trial patient matching PoC**
 using synthetic EHR-style data.
 
-We are building it step-by-step.
-
-**Current focus**
-1. Generate a synthetic patient dataset
-2. Accept mock protocol criteria as text (or uploaded .txt file)
-3. Parse the protocol text into structured criteria (NLP-lite)
-
-Next steps:
-- Use the parsed criteria to score and rank patients by match
+**What it does now**
+1. Generates a synthetic patient dataset
+2. Accepts mock protocol criteria as free text (or uploaded .txt file)
+3. Parses the protocol into structured criteria (NLP-lite)
+4. Applies a transparent, rule-based scoring system to rank patients by match
 """
 )
 
@@ -205,10 +313,7 @@ patients_df = generate_synthetic_patients(n=n_patients, seed=seed)
 
 st.subheader("👥 Synthetic Patient Dataset")
 st.caption("These records are fully synthetic and generated on the fly for PoC purposes.")
-st.dataframe(patients_df, use_container_width=True, height=400)
-
-st.markdown("**Basic summary statistics**")
-st.write(patients_df.describe(include="all"))
+st.dataframe(patients_df, use_container_width=True, height=350)
 
 # -----------------------------
 # Protocol criteria input
@@ -241,7 +346,7 @@ protocol_text = st.text_area(
     height=180,
     help=(
         "This represents the free-text eligibility description from a clinical trial protocol.\n"
-        "The app will parse this into structured criteria below."
+        "The app parses this into structured criteria and uses it to score patients."
     ),
 )
 
@@ -256,13 +361,70 @@ criteria = parse_protocol_text(protocol_text)
 st.markdown("**Parsed structured criteria (NLP-lite):**")
 st.json(criteria)
 
-st.info(
-    "✅ The protocol text is now being parsed into a structured representation.\n\n"
-    "Next step will be to use these criteria to score and rank each patient based on how well they match."
+# -----------------------------
+# Score and rank patients
+# -----------------------------
+st.markdown("---")
+st.subheader("🧮 Ranked Patient Matches")
+
+# Let user choose minimum score threshold
+min_score = st.slider(
+    "Minimum MatchScore to display",
+    min_value=0,
+    max_value=100,
+    value=60,
+    step=5,
+    help="Filter out patients whose match score is below this threshold."
+)
+
+scored_df = score_patients(patients_df, criteria)
+
+# Apply threshold
+view = scored_df[scored_df["MatchScore"] >= min_score].copy()
+
+# Filters
+c1, c2, c3 = st.columns(3)
+with c1:
+    gender_filter = st.multiselect(
+        "Filter by Gender",
+        options=sorted(scored_df["Gender"].dropna().unique().tolist())
+    )
+with c2:
+    diag_filter = st.multiselect(
+        "Filter by Diagnosis",
+        options=sorted(scored_df["Diagnosis"].dropna().unique().tolist())
+    )
+with c3:
+    loc_filter = st.multiselect(
+        "Filter by Location",
+        options=sorted(scored_df["Location"].dropna().unique().tolist())
+    )
+
+if gender_filter:
+    view = view[view["Gender"].isin(gender_filter)]
+if diag_filter:
+    view = view[view["Diagnosis"].isin(diag_filter)]
+if loc_filter:
+    view = view[view["Location"].isin(loc_filter)]
+
+st.caption("Patients sorted by MatchScore (highest first).")
+st.dataframe(view, use_container_width=True, height=350)
+
+# Simple score distribution chart (all patients)
+st.markdown("**MatchScore distribution (all patients)**")
+st.bar_chart(scored_df["MatchScore"].value_counts().sort_index())
+
+# Download scored results
+csv_data = scored_df.to_csv(index=False)
+st.download_button(
+    "⬇️ Download all scored results (CSV)",
+    data=csv_data,
+    file_name="scored_patient_matches.csv",
+    mime="text/csv",
 )
 
 st.info(
-    "✅ You can now define trial eligibility as free text.\n\n"
-    "In the next step, we'll add a parser that turns this into structured criteria "
-    "and then score patients against it."
+    "✅ You now have an end-to-end PoC: synthetic patients → protocol text → parsed criteria → "
+    "rule-based AI scoring → ranked patient list.\n\n"
+    "You can adjust the protocol text and immediately see how eligibility and scores change."
 )
