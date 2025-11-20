@@ -4,6 +4,9 @@ import numpy as np
 import re
 import json
 
+# -----------------------------
+# Synthetic patient generator
+# -----------------------------
 def generate_synthetic_patients(n=300, seed=42):
     rng = np.random.default_rng(seed)
 
@@ -25,29 +28,26 @@ def generate_synthetic_patients(n=300, seed=42):
             "Age": rng.integers(18, 85, size=n),
             "Gender": rng.choice(genders, size=n, p=[0.49, 0.49, 0.02]),
             "Diagnosis": rng.choice(diagnoses, size=n),
+            # Two generic biomarkers for PoC (kept generic on purpose)
             "Biomarker_A": np.round(rng.normal(loc=2.0, scale=0.7, size=n), 2),
             "Biomarker_B": np.round(rng.normal(loc=50, scale=15, size=n), 1),
             "Smoker": rng.choice([0, 1], size=n, p=[0.8, 0.2]),
             "Medications": rng.choice(meds, size=n),
             "Location": rng.choice(regions, size=n),
 
-            # NEW FIELDS ↓↓↓
-            # Distance to clinic (km): 1–80 km
+            # Fields for completion likelihood
             "DistanceToClinic_km": rng.integers(1, 80, size=n),
-
-            # Rough comorbidity index: 0–4
             "ComorbidityIndex": rng.integers(0, 5, size=n),
         }
     )
 
-    # Add small missingness to biomarkers
+    # Add a little missingness so it feels realistic
     mask_a = rng.random(n) < 0.05
     mask_b = rng.random(n) < 0.05
     df.loc[mask_a, "Biomarker_A"] = np.nan
     df.loc[mask_b, "Biomarker_B"] = np.nan
 
     return df
-
 
 
 # -----------------------------
@@ -149,7 +149,7 @@ def parse_protocol_text(txt: str):
 
 
 # -----------------------------
-# Simple rule-based scoring
+# Eligibility scoring (MatchScore)
 # -----------------------------
 
 def compare(value, op, threshold):
@@ -171,7 +171,7 @@ def compare(value, op, threshold):
 
 def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
     """
-    Simple, transparent scoring:
+    Simple, transparent eligibility scoring:
     - Age match: up to 20 points
     - Diagnosis match: 25 points
     - Biomarkers: up to 35 points (shared)
@@ -257,7 +257,89 @@ def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
 
 
 # -----------------------------
-# Streamlit app
+# Completion likelihood scoring (CompletionScore)
+# -----------------------------
+
+def compute_completion_score(df: pd.DataFrame):
+    """
+    Estimate likelihood of study completion using simple, rule-based logic.
+    Uses distance to clinic, age band, comorbidity burden, and smoking status.
+    """
+    scores = []
+    explanations = []
+
+    for _, row in df.iterrows():
+        s = 0.0
+        reasons = []
+
+        # Distance to clinic
+        d = row.get("DistanceToClinic_km", np.nan)
+        if pd.isna(d):
+            reasons.append("~ distance unknown")
+        else:
+            if d <= 10:
+                s += 30
+                reasons.append(f"+ very close to clinic (≤10 km, {d} km)")
+            elif d <= 30:
+                s += 20
+                reasons.append(f"+ reasonable distance (11–30 km, {d} km)")
+            else:
+                s += 10
+                reasons.append(f"~ long travel distance (>30 km, {d} km)")
+
+        # Age band
+        age = row.get("Age", np.nan)
+        if pd.isna(age):
+            reasons.append("~ age unknown")
+        else:
+            if 30 <= age <= 65:
+                s += 25
+                reasons.append(f"+ prime adult age (30–65, age={age})")
+            elif 18 <= age < 30:
+                s += 15
+                reasons.append(f"~ younger adult (18–29, age={age})")
+            else:
+                s += 10
+                reasons.append(f"~ older adult (>65, age={age})")
+
+        # Comorbidity index
+        com = row.get("ComorbidityIndex", np.nan)
+        if pd.isna(com):
+            reasons.append("~ comorbidity index unknown")
+        else:
+            if com <= 1:
+                s += 25
+                reasons.append(f"+ low comorbidity burden (≤1, index={com})")
+            elif com <= 3:
+                s += 15
+                reasons.append(f"~ moderate comorbidity burden (2–3, index={com})")
+            else:
+                s += 5
+                reasons.append(f"- high comorbidity burden (≥4, index={com})")
+
+        # Smoking
+        smoker = row.get("Smoker", None)
+        if smoker == 0:
+            s += 20
+            reasons.append("+ non-smoker (better adherence on average)")
+        elif smoker == 1:
+            s += 5
+            reasons.append("~ smoker (slightly higher dropout risk)")
+        else:
+            reasons.append("~ smoking status unknown")
+
+        s = float(np.clip(s, 0, 100))
+        scores.append(s)
+        explanations.append(reasons)
+
+    out = df.copy()
+    out["CompletionScore"] = np.round(scores, 1)
+    out["CompletionExplanation"] = [json.dumps(r, ensure_ascii=False) for r in explanations]
+    return out
+
+
+# -----------------------------
+# Streamlit app layout
 # -----------------------------
 st.set_page_config(
     page_title="Clinical Trial Matching PoC",
@@ -272,12 +354,13 @@ st.markdown(
 This app demonstrates a **simple AI-assisted clinical trial patient matching PoC**
 using synthetic EHR-style data.
 
-**Current capabilities**
+**What it does**
 1. Generates a synthetic patient dataset
 2. Accepts mock protocol criteria as free text (or uploaded .txt file)
 3. Parses the protocol into structured criteria (NLP-lite)
-4. Applies a transparent, rule-based scoring system to rank patients by match
-5. Provides a simple chatbot-style interface to query trial criteria
+4. Applies a rule-based scoring system to rank patients by eligibility (**MatchScore**)
+5. Estimates likelihood of study completion (**CompletionScore**)
+6. Provides a simple chatbot-style interface that uses the same scoring logic
 """
 )
 
@@ -315,7 +398,7 @@ patients_df = generate_synthetic_patients(n=n_patients, seed=seed)
 
 st.subheader("👥 Synthetic Patient Dataset")
 st.caption("These records are fully synthetic and generated on the fly for PoC purposes.")
-st.dataframe(patients_df, use_container_width=True, height=350)
+st.dataframe(patients_df, use_container_width=True, height=320)
 
 # -----------------------------
 # Protocol criteria input
@@ -375,12 +458,22 @@ min_score = st.slider(
     max_value=100,
     value=60,
     step=5,
-    help="Filter out patients whose match score is below this threshold."
+    help="Filter out patients whose eligibility match score is below this threshold."
 )
 
+# Eligibility scoring
 scored_df = score_patients(patients_df, criteria)
 
-# Apply threshold
+# Completion scoring
+scored_df = compute_completion_score(scored_df)
+
+# Composite score (for interpretation)
+scored_df["FinalCompositeScore"] = np.round(
+    0.7 * scored_df["MatchScore"] + 0.3 * scored_df["CompletionScore"],
+    1,
+)
+
+# Apply threshold on MatchScore
 view = scored_df[scored_df["MatchScore"] >= min_score].copy()
 
 # Filters
@@ -408,19 +501,37 @@ if diag_filter:
 if loc_filter:
     view = view[view["Location"].isin(loc_filter)]
 
-st.caption("Patients sorted by MatchScore (highest first).")
-st.dataframe(view, use_container_width=True, height=350)
+st.caption("Patients sorted by eligibility MatchScore (highest first).")
 
-# Simple score distribution chart (all patients)
+cols_to_show = [
+    "PatientID",
+    "MatchScore",
+    "CompletionScore",
+    "FinalCompositeScore",
+    "Age",
+    "DistanceToClinic_km",
+    "ComorbidityIndex",
+    "Gender",
+    "Diagnosis",
+    "Location",
+]
+cols_to_show = [c for c in cols_to_show if c in view.columns]
+
+st.dataframe(view[cols_to_show], use_container_width=True, height=320)
+
+# Simple score distribution charts (all patients)
 st.markdown("**MatchScore distribution (all patients)**")
 st.bar_chart(scored_df["MatchScore"].value_counts().sort_index())
+
+st.markdown("**CompletionScore distribution (all patients)**")
+st.bar_chart(scored_df["CompletionScore"].value_counts().sort_index())
 
 # Download scored results
 csv_data = scored_df.to_csv(index=False)
 st.download_button(
     "⬇️ Download all scored results (CSV)",
     data=csv_data,
-    file_name="scored_patient_matches.csv",
+    file_name="scored_patient_matches_with_completion.csv",
     mime="text/csv",
 )
 
@@ -436,7 +547,7 @@ Type a natural-language description of trial criteria below.
 The assistant will:
 
 1. Parse your message into structured criteria (using the same NLP-lite logic)
-2. Score all synthetic patients
+2. Score all synthetic patients for **eligibility (MatchScore)** and **completion likelihood (CompletionScore)**
 3. Reply with parsed criteria and the top 5 matching patients
 """
 )
@@ -449,7 +560,7 @@ chat_input = st.text_input(
     key="chat_input",
 )
 
-if st.button("Send", type="primary"):
+if st.button("Send"):
     user_text = chat_input.strip()
     if user_text:
         # Add user message to history
@@ -457,17 +568,30 @@ if st.button("Send", type="primary"):
             {"role": "user", "text": user_text}
         )
 
-        # Parse & score
+        # Parse & score using the same engine
         chat_criteria = parse_protocol_text(user_text)
         chat_scored = score_patients(patients_df, chat_criteria)
-        top5 = chat_scored.head(5)[["PatientID", "MatchScore", "Age", "Gender", "Diagnosis"]]
+        chat_scored = compute_completion_score(chat_scored)
+
+        # Sort by MatchScore, then CompletionScore
+        chat_scored["FinalCompositeScore"] = np.round(
+            0.7 * chat_scored["MatchScore"] + 0.3 * chat_scored["CompletionScore"],
+            1,
+        )
+        chat_scored = chat_scored.sort_values(
+            ["MatchScore", "CompletionScore"], ascending=False
+        )
+
+        top5 = chat_scored.head(5)[
+            ["PatientID", "MatchScore", "CompletionScore", "Age", "Gender", "Diagnosis"]
+        ]
 
         # Build assistant reply text
         reply_lines = []
         reply_lines.append("Parsed criteria:")
         reply_lines.append(json.dumps(chat_criteria, indent=2))
         reply_lines.append("")
-        reply_lines.append("Top 5 matching patients (PatientID, MatchScore, Age, Gender, Diagnosis):")
+        reply_lines.append("Top 5 matching patients (PatientID, MatchScore, CompletionScore, Age, Gender, Diagnosis):")
         reply_lines.append(top5.to_string(index=False))
 
         reply_text = "\n".join(reply_lines)
@@ -489,5 +613,6 @@ for msg in st.session_state["chat_history"]:
 
 st.info(
     "This chatbot-style interface reuses the same parsing and scoring engine as the main view, "
-    "but wraps it in a conversational experience."
+    "and returns both **MatchScore** (eligibility) and **CompletionScore** (likelihood to complete) "
+    "for a small set of top candidates."
 )
