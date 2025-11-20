@@ -4,9 +4,6 @@ import numpy as np
 import re
 import json
 
-# -----------------------------
-# Synthetic patient generator
-# -----------------------------
 def generate_synthetic_patients(n=300, seed=42):
     rng = np.random.default_rng(seed)
 
@@ -28,22 +25,29 @@ def generate_synthetic_patients(n=300, seed=42):
             "Age": rng.integers(18, 85, size=n),
             "Gender": rng.choice(genders, size=n, p=[0.49, 0.49, 0.02]),
             "Diagnosis": rng.choice(diagnoses, size=n),
-            # Two generic biomarkers for PoC (kept generic on purpose)
             "Biomarker_A": np.round(rng.normal(loc=2.0, scale=0.7, size=n), 2),
             "Biomarker_B": np.round(rng.normal(loc=50, scale=15, size=n), 1),
             "Smoker": rng.choice([0, 1], size=n, p=[0.8, 0.2]),
             "Medications": rng.choice(meds, size=n),
             "Location": rng.choice(regions, size=n),
+
+            # NEW FIELDS ↓↓↓
+            # Distance to clinic (km): 1–80 km
+            "DistanceToClinic_km": rng.integers(1, 80, size=n),
+
+            # Rough comorbidity index: 0–4
+            "ComorbidityIndex": rng.integers(0, 5, size=n),
         }
     )
 
-    # Add a little missingness so it feels realistic
+    # Add small missingness to biomarkers
     mask_a = rng.random(n) < 0.05
     mask_b = rng.random(n) < 0.05
     df.loc[mask_a, "Biomarker_A"] = np.nan
     df.loc[mask_b, "Biomarker_B"] = np.nan
 
     return df
+
 
 
 # -----------------------------
