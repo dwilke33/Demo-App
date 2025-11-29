@@ -171,22 +171,29 @@ def compare(value, op, threshold):
 
 def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
     """
-    Simple, transparent eligibility scoring:
+    Eligibility scoring:
     - Age match: up to 20 points
     - Diagnosis match: 25 points
     - Biomarkers: up to 35 points (shared)
     - Non-smoker when smokers are excluded: 20 points
+
+    Also returns per-category sub-scores for transparency.
     """
     if weight_cfg is None:
         weight_cfg = {
             "age": 20,
             "diagnosis": 25,
-            "biomarkers_total": 35,   # split equally across listed biomarkers
+            "biomarkers_total": 35,
             "exclude_smokers": 20,
         }
 
     scores = []
     explanations = []
+
+    age_scores = []
+    diag_scores = []
+    biomarker_scores = []
+    smoker_scores = []
 
     n_bio = max(1, len(criteria.get("biomarkers", []))) if criteria.get("biomarkers") else 0
     bio_each = weight_cfg["biomarkers_total"] / n_bio if n_bio > 0 else 0
@@ -194,6 +201,11 @@ def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
     for _, row in df.iterrows():
         s = 0.0
         reasons = []
+
+        age_score = 0.0
+        diag_score = 0.0
+        bio_score = 0.0
+        smoker_score = 0.0
 
         # ---- Age ----
         age_ok = True
@@ -211,13 +223,15 @@ def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
                 age_ok = False
         if (criteria.get("age_min") is not None) or (criteria.get("age_max") is not None):
             if age_ok:
-                s += weight_cfg["age"]
+                age_score = weight_cfg["age"]
+                s += age_score
 
         # ---- Diagnosis ----
         diag_req = criteria.get("diagnosis_required")
         if diag_req:
             if diag_req.lower() in str(row["Diagnosis"]).lower():
-                s += weight_cfg["diagnosis"]
+                diag_score = weight_cfg["diagnosis"]
+                s += diag_score
                 reasons.append(f"+ diagnosis matches ({diag_req})")
             else:
                 reasons.append(f"- diagnosis mismatch (needs {diag_req})")
@@ -230,6 +244,7 @@ def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
             if comp is None:
                 reasons.append(f"~ {col} missing")
             elif comp:
+                bio_score += bio_each
                 s += bio_each
                 reasons.append(f"+ {col} {bio['op']} {bio['value']}")
             else:
@@ -238,7 +253,8 @@ def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
         # ---- Exclude smokers ----
         if criteria.get("exclude_smokers", False):
             if row["Smoker"] == 0:
-                s += weight_cfg["exclude_smokers"]
+                smoker_score = weight_cfg["exclude_smokers"]
+                s += smoker_score
                 reasons.append("+ non-smoker")
             else:
                 reasons.append("- smoker (excluded)")
@@ -248,9 +264,19 @@ def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
         scores.append(s)
         explanations.append(reasons)
 
+        age_scores.append(round(age_score, 1))
+        diag_scores.append(round(diag_score, 1))
+        biomarker_scores.append(round(bio_score, 1))
+        smoker_scores.append(round(smoker_score, 1))
+
     out = df.copy()
     out["MatchScore"] = np.round(scores, 1)
+    out["Match_AgeScore"] = age_scores
+    out["Match_DiagnosisScore"] = diag_scores
+    out["Match_BiomarkerScore"] = biomarker_scores
+    out["Match_SmokerScore"] = smoker_scores
     out["Explanation"] = [json.dumps(r, ensure_ascii=False) for r in explanations]
+
     out.sort_values("MatchScore", ascending=False, inplace=True)
     out.reset_index(drop=True, inplace=True)
     return out
@@ -262,15 +288,30 @@ def score_patients(df: pd.DataFrame, criteria: dict, weight_cfg=None):
 
 def compute_completion_score(df: pd.DataFrame):
     """
-    Estimate likelihood of study completion using simple, rule-based logic.
-    Uses distance to clinic, age band, comorbidity burden, and smoking status.
+    Estimate likelihood of study completion using:
+    - Distance to clinic (0–30)
+    - Age band (0–25)
+    - Comorbidity index (0–25)
+    - Smoking status (0–20)
+
+    Also returns per-category sub-scores.
     """
     scores = []
     explanations = []
 
+    dist_scores = []
+    age_band_scores = []
+    comorb_scores = []
+    smoke_scores = []
+
     for _, row in df.iterrows():
         s = 0.0
         reasons = []
+
+        dist_score = 0.0
+        age_score = 0.0
+        com_score = 0.0
+        smoke_score = 0.0
 
         # Distance to clinic
         d = row.get("DistanceToClinic_km", np.nan)
@@ -278,14 +319,15 @@ def compute_completion_score(df: pd.DataFrame):
             reasons.append("~ distance unknown")
         else:
             if d <= 10:
-                s += 30
+                dist_score = 30
                 reasons.append(f"+ very close to clinic (≤10 km, {d} km)")
             elif d <= 30:
-                s += 20
+                dist_score = 20
                 reasons.append(f"+ reasonable distance (11–30 km, {d} km)")
             else:
-                s += 10
+                dist_score = 10
                 reasons.append(f"~ long travel distance (>30 km, {d} km)")
+            s += dist_score
 
         # Age band
         age = row.get("Age", np.nan)
@@ -293,14 +335,15 @@ def compute_completion_score(df: pd.DataFrame):
             reasons.append("~ age unknown")
         else:
             if 30 <= age <= 65:
-                s += 25
+                age_score = 25
                 reasons.append(f"+ prime adult age (30–65, age={age})")
             elif 18 <= age < 30:
-                s += 15
+                age_score = 15
                 reasons.append(f"~ younger adult (18–29, age={age})")
             else:
-                s += 10
+                age_score = 10
                 reasons.append(f"~ older adult (>65, age={age})")
+            s += age_score
 
         # Comorbidity index
         com = row.get("ComorbidityIndex", np.nan)
@@ -308,32 +351,43 @@ def compute_completion_score(df: pd.DataFrame):
             reasons.append("~ comorbidity index unknown")
         else:
             if com <= 1:
-                s += 25
+                com_score = 25
                 reasons.append(f"+ low comorbidity burden (≤1, index={com})")
             elif com <= 3:
-                s += 15
+                com_score = 15
                 reasons.append(f"~ moderate comorbidity burden (2–3, index={com})")
             else:
-                s += 5
+                com_score = 5
                 reasons.append(f"- high comorbidity burden (≥4, index={com})")
+            s += com_score
 
         # Smoking
         smoker = row.get("Smoker", None)
         if smoker == 0:
-            s += 20
+            smoke_score = 20
             reasons.append("+ non-smoker (better adherence on average)")
         elif smoker == 1:
-            s += 5
+            smoke_score = 5
             reasons.append("~ smoker (slightly higher dropout risk)")
         else:
             reasons.append("~ smoking status unknown")
+        s += smoke_score
 
         s = float(np.clip(s, 0, 100))
         scores.append(s)
         explanations.append(reasons)
 
+        dist_scores.append(dist_score)
+        age_band_scores.append(age_score)
+        comorb_scores.append(com_score)
+        smoke_scores.append(smoke_score)
+
     out = df.copy()
     out["CompletionScore"] = np.round(scores, 1)
+    out["Comp_DistanceScore"] = dist_scores
+    out["Comp_AgeBandScore"] = age_band_scores
+    out["Comp_ComorbidityScore"] = comorb_scores
+    out["Comp_SmokingScore"] = smoke_scores
     out["CompletionExplanation"] = [json.dumps(r, ensure_ascii=False) for r in explanations]
     return out
 
@@ -355,12 +409,12 @@ This app demonstrates a **simple AI-assisted clinical trial patient matching PoC
 using synthetic EHR-style data.
 
 **What it does**
-1. Generates a synthetic patient dataset
-2. Accepts mock protocol criteria as free text (or uploaded .txt file)
-3. Parses the protocol into structured criteria (NLP-lite)
-4. Applies a rule-based scoring system to rank patients by eligibility (**MatchScore**)
-5. Estimates likelihood of study completion (**CompletionScore**)
-6. Provides a simple chatbot-style interface that uses the same scoring logic
+1. Generates a synthetic patient dataset  
+2. Accepts mock protocol criteria as free text (or uploaded .txt file)  
+3. Parses the protocol into structured criteria (NLP-lite)  
+4. Applies a rule-based scoring system to rank patients by eligibility (**MatchScore**)  
+5. Estimates likelihood of study completion (**CompletionScore**)  
+6. Provides a simple chatbot-style interface that uses the same scoring logic  
 """
 )
 
@@ -445,6 +499,32 @@ criteria = parse_protocol_text(protocol_text)
 
 st.markdown("**Parsed structured criteria (NLP-lite):**")
 st.json(criteria)
+
+# -----------------------------
+# Scoring rubric explanation
+# -----------------------------
+st.markdown("---")
+st.subheader("🧮 How the scoring works")
+
+st.markdown(
+    """
+**Eligibility – MatchScore (0–100)**  
+
+- **Age match**: up to **20 points**  
+- **Diagnosis match**: up to **25 points**  
+- **Biomarkers (A/B)**: up to **35 points total** (split evenly across listed biomarkers)  
+- **Non-smoker when smokers are excluded**: up to **20 points**  
+
+**Completion – CompletionScore (0–100)**  
+
+- **Distance to clinic**: up to **30 points**  
+- **Age band**: up to **25 points**  
+- **Comorbidity index**: up to **25 points**  
+- **Smoking status**: up to **20 points**  
+
+**FinalCompositeScore** = `0.7 × MatchScore + 0.3 × CompletionScore`
+"""
+)
 
 # -----------------------------
 # Score and rank patients (main view)
@@ -536,6 +616,58 @@ st.download_button(
 )
 
 # -----------------------------
+# Detailed per-patient scoring breakdown
+# -----------------------------
+st.markdown("---")
+st.subheader("🔍 Inspect scoring for a single patient")
+
+if not view.empty:
+    selected_id = st.selectbox(
+        "Select a PatientID to see detailed scoring",
+        options=view["PatientID"].tolist(),
+    )
+
+    selected_row = scored_df[scored_df["PatientID"] == selected_id].iloc[0]
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("**Eligibility (MatchScore) breakdown**")
+        st.write(f"Total MatchScore: **{selected_row['MatchScore']}** / 100")
+        st.write(
+            {
+                "Age": selected_row["Match_AgeScore"],
+                "Diagnosis": selected_row["Match_DiagnosisScore"],
+                "Biomarkers": selected_row["Match_BiomarkerScore"],
+                "Non-smoker exclusion": selected_row["Match_SmokerScore"],
+            }
+        )
+
+        match_reasons = json.loads(selected_row["Explanation"])
+        st.markdown("**Reasoning:**")
+        for r in match_reasons:
+            st.markdown(f"- {r}")
+
+    with c2:
+        st.markdown("**Completion (CompletionScore) breakdown**")
+        st.write(f"Total CompletionScore: **{selected_row['CompletionScore']}** / 100")
+        st.write(
+            {
+                "Distance to clinic": selected_row["Comp_DistanceScore"],
+                "Age band": selected_row["Comp_AgeBandScore"],
+                "Comorbidity": selected_row["Comp_ComorbidityScore"],
+                "Smoking": selected_row["Comp_SmokingScore"],
+            }
+        )
+
+        comp_reasons = json.loads(selected_row["CompletionExplanation"])
+        st.markdown("**Reasoning:**")
+        for r in comp_reasons:
+            st.markdown(f"- {r}")
+else:
+    st.info("No patients meet the current MatchScore threshold and filters.")
+
+# -----------------------------
 # Chatbot-style interface
 # -----------------------------
 st.markdown("---")
@@ -546,9 +678,9 @@ st.markdown(
 Type a natural-language description of trial criteria below.
 The assistant will:
 
-1. Parse your message into structured criteria (using the same NLP-lite logic)
-2. Score all synthetic patients for **eligibility (MatchScore)** and **completion likelihood (CompletionScore)**
-3. Reply with parsed criteria and the top 5 matching patients
+1. Parse your message into structured criteria (using the same NLP-lite logic)  
+2. Score all synthetic patients for **eligibility (MatchScore)** and **completion likelihood (CompletionScore)**  
+3. Reply with parsed criteria and the top 5 matching patients  
 """
 )
 
